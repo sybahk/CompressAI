@@ -206,6 +206,7 @@ class ScaleSpaceFlow(CompressionModel):
         self.sigma0 = sigma0
         self.num_levels = num_levels
         self.scale_field_shift = scale_field_shift
+        self.train_patch_size = 256
 
     def forward(self, frames):
         if not isinstance(frames, List):
@@ -371,8 +372,12 @@ class ScaleSpaceFlow(CompressionModel):
         return out.squeeze(2)
 
     def forward_prediction(self, x_ref, motion_info):
+        b, _, h, w = motion_info.shape
         flow, scale_field = motion_info.chunk(2, dim=1)
-
+        weighting = torch.Tensor([[self.train_patch_size / w, self.train_patch_size / h]]).to(x_ref)
+        weighting = weighting.repeat(b, 1)
+        weighting = weighting.unsqueeze_(2).unsqueeze_(3)
+        flow = flow * weighting
         volume = self.gaussian_volume(x_ref, self.sigma0, self.num_levels)
         x_pred = self.warp_volume(volume, flow, scale_field)
         return x_pred
