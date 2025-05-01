@@ -27,7 +27,7 @@
 # OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import torch
 import torch.nn as nn
@@ -40,7 +40,6 @@ from compressai.ops import quantize_ste
 from compressai.registry import register_module
 
 from .base import LatentCodec
-from .gaussian_conditional import GaussianConditionalLatentCodec
 
 __all__ = [
     "CheckerboardLatentCodec",
@@ -109,16 +108,11 @@ class CheckerboardLatentCodec(LatentCodec):
         □   empty
     """
 
-    latent_codec: Mapping[str, LatentCodec]
-
-    entropy_parameters: nn.Module
-    context_prediction: CheckerboardMaskedConv2d
-
     def __init__(
         self,
-        latent_codec: Optional[Mapping[str, LatentCodec]] = None,
-        entropy_parameters: Optional[nn.Module] = None,
-        context_prediction: Optional[nn.Module] = None,
+        latent_codec: Mapping[str, LatentCodec],
+        entropy_parameters: nn.Module,
+        context_prediction: CheckerboardMaskedConv2d,
         anchor_parity="even",
         forward_method="twopass",
         **kwargs,
@@ -128,16 +122,10 @@ class CheckerboardLatentCodec(LatentCodec):
         self.anchor_parity = anchor_parity
         self.non_anchor_parity = {"odd": "even", "even": "odd"}[anchor_parity]
         self.forward_method = forward_method
-        self.entropy_parameters = entropy_parameters or nn.Identity()
-        self.context_prediction = context_prediction or nn.Identity()
-        self._set_group_defaults(
-            "latent_codec",
-            latent_codec,
-            defaults={
-                "y": lambda: GaussianConditionalLatentCodec(quantizer="ste"),
-            },
-            save_direct=True,
-        )
+        self.entropy_parameters = entropy_parameters
+        self.context_prediction = context_prediction
+        self.y = latent_codec["y"]
+        self.latent_codec = latent_codec
 
     def __getitem__(self, key: str) -> LatentCodec:
         return self.latent_codec[key]
@@ -188,14 +176,36 @@ class CheckerboardLatentCodec(LatentCodec):
 
         params = y.new_zeros((B, C * 2, H, W))
 
-        y_hat_anchors = self._forward_twopass_step(
-            y, side_params, params, self._y_ctx_zero(y), "anchor"
-        )
+        y_hat_ = []
 
-        y_hat_non_anchors = self._forward_twopass_step(
-            y, side_params, params, self.context_prediction(y_hat_anchors), "non_anchor"
-        )
+        # NOTE: The _i variables contain only the current step's pixels.
+        # i=0: step=anchor
+        # i=1: step=non_anchor
 
+        for step in ("anchor", "non_anchor"):
+            if step == "anchor":
+                y_ctx = self._y_ctx_zero(y)
+            else:  # step == "non_anchor"
+                y_hat_anchors = y_hat_[0]
+                y_ctx = self.context_prediction(y_hat_anchors)
+
+            params_i = self.entropy_parameters(self.merge(y_ctx, side_params))
+
+            # Save params for current step. This is later used for entropy estimation.
+            self._copy(params, params_i, step)
+
+            # Keep only elements needed for current step.
+            # It's not necessary to mask the rest out just yet, but it doesn't hurt.
+            params_i = self._keep_only(params_i, step)
+            y_i = self._keep_only(y, step)
+
+            # Determine y_hat for current step, and mask out the other pixels.
+            _, means_i = self.latent_codec["y"]._chunk(params_i)
+            y_hat_i = self._keep_only(quantize_ste(y_i - means_i) + means_i, step)
+
+            y_hat_.append(y_hat_i)
+
+        [y_hat_anchors, y_hat_non_anchors] = y_hat_
         y_hat = y_hat_anchors + y_hat_non_anchors
         y_out = self.latent_codec["y"](y, params)
 
@@ -205,32 +215,6 @@ class CheckerboardLatentCodec(LatentCodec):
             },
             "y_hat": y_hat,
         }
-
-    def _forward_twopass_step(
-        self, y: Tensor, side_params: Tensor, params: Tensor, y_ctx: Tensor, step: str
-    ) -> Dict[str, Any]:
-        # NOTE: The _i variables contain only the current step's pixels.
-        assert step in ("anchor", "non_anchor")
-
-        params_i = self.entropy_parameters(self.merge(y_ctx, side_params))
-
-        # Save params for current step. This is later used for entropy estimation.
-        self._copy(params, params_i, step)
-
-        # Apply latent_codec's "entropy_parameters()", if it exists. Usually identity.
-        func = getattr(self.latent_codec["y"], "entropy_parameters", lambda x: x)
-        params_i = func(params_i)
-
-        # Keep only elements needed for current step.
-        # It's not necessary to mask the rest out just yet, but it doesn't hurt.
-        params_i = self._keep_only(params_i, step)
-        y_i = self._keep_only(y, step)
-
-        # Determine y_hat for current step, and mask out the other pixels.
-        _, means_i = self.latent_codec["y"]._chunk(params_i)
-        y_hat_i = self._keep_only(quantize_ste(y_i - means_i) + means_i, step)
-
-        return y_hat_i
 
     def _forward_twopass_faster(self, y: Tensor, side_params: Tensor) -> Dict[str, Any]:
         """Runs the entropy parameters network in two passes.
@@ -243,8 +227,6 @@ class CheckerboardLatentCodec(LatentCodec):
         """
         y_ctx = self._y_ctx_zero(y)
         params = self.entropy_parameters(self.merge(y_ctx, side_params))
-        func = getattr(self.latent_codec["y"], "entropy_parameters", lambda x: x)
-        params = func(params)
         params = self._keep_only(params, "anchor")  # Probably unnecessary.
         _, means_hat = self.latent_codec["y"]._chunk(params)
         y_hat_anchors = quantize_ste(y - means_hat) + means_hat
@@ -269,8 +251,7 @@ class CheckerboardLatentCodec(LatentCodec):
     @torch.no_grad()
     def _y_ctx_zero(self, y: Tensor) -> Tensor:
         """Create a zero tensor with correct shape for y_ctx."""
-        y_ctx_meta = self.context_prediction(y.to("meta"))
-        return y.new_zeros(y_ctx_meta.shape)
+        return self._mask_all(self.context_prediction(y).detach())
 
     def compress(self, y: Tensor, side_params: Tensor) -> Dict[str, Any]:
         n, c, h, w = y.shape
@@ -282,7 +263,7 @@ class CheckerboardLatentCodec(LatentCodec):
         for i in range(2):
             y_ctx_i = self.unembed(self.context_prediction(self.embed(y_hat_)))[i]
             if i == 0:
-                y_ctx_i = self._mask(y_ctx_i, "all")
+                y_ctx_i = self._mask_all(y_ctx_i)
             params_i = self.entropy_parameters(self.merge(y_ctx_i, side_params_[i]))
             y_out = self.latent_codec["y"].compress(y_[i], params_i)
             y_hat_[i] = y_out["y_hat"]
@@ -316,7 +297,7 @@ class CheckerboardLatentCodec(LatentCodec):
         for i in range(2):
             y_ctx_i = self.unembed(self.context_prediction(self.embed(y_hat_)))[i]
             if i == 0:
-                y_ctx_i = self._mask(y_ctx_i, "all")
+                y_ctx_i = self._mask_all(y_ctx_i)
             params_i = self.entropy_parameters(self.merge(y_ctx_i, side_params_[i]))
             y_out = self.latent_codec["y"].decompress(
                 [y_strings_[i]], y_i_shape, params_i
@@ -387,25 +368,21 @@ class CheckerboardLatentCodec(LatentCodec):
             dest[..., 0::2, 1::2] = src[..., 0::2, 1::2]
             dest[..., 1::2, 0::2] = src[..., 1::2, 0::2]
 
-    def _keep_only(self, y: Tensor, step: str, inplace: bool = False) -> Tensor:
+    def _keep_only(self, y: Tensor, step: str) -> Tensor:
         """Keep only pixels in the current step, and zero out the rest."""
-        return self._mask(
-            y,
-            parity=self.non_anchor_parity if step == "anchor" else self.anchor_parity,
-            inplace=inplace,
-        )
-
-    def _mask(self, y: Tensor, parity: str, inplace: bool = False) -> Tensor:
-        if not inplace:
-            y = y.clone()
+        y = y.clone()
+        parity = self.anchor_parity if step == "anchor" else self.non_anchor_parity
         if parity == "even":
-            y[..., 0::2, 0::2] = 0
-            y[..., 1::2, 1::2] = 0
-        elif parity == "odd":
             y[..., 0::2, 1::2] = 0
             y[..., 1::2, 0::2] = 0
-        elif parity == "all":
-            y[:] = 0
+        elif parity == "odd":
+            y[..., 0::2, 0::2] = 0
+            y[..., 1::2, 1::2] = 0
+        return y
+
+    def _mask_all(self, y: Tensor) -> Tensor:
+        y = y.clone()
+        y[:] = 0
         return y
 
     def merge(self, *args):
